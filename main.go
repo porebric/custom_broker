@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"container/list"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -44,11 +47,83 @@ type queue struct {
 }
 
 type broker struct {
-	mu sync.Mutex
-	qs map[string]*queue
+	mu  sync.Mutex
+	qs  map[string]*queue
+	log *os.File // append-only WAL; nil when persistence disabled
 }
 
-func newBroker() *broker { return &broker{qs: map[string]*queue{}} }
+// JSON-lines WAL: one record per line, fsync after each.
+type record struct {
+	Op string `json:"op"`          // "P" = put, "G" = consumed from head
+	Q  string `json:"q"`           // queue name
+	V  string `json:"v,omitempty"` // payload (P only)
+}
+
+func newBroker(path string) (*broker, error) {
+	b := &broker{qs: map[string]*queue{}}
+	if path == "" {
+		return b, nil
+	}
+	if err := b.replay(path); err != nil {
+		return nil, fmt.Errorf("replay: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	b.log = f
+	return b, nil
+}
+
+func (b *broker) close() error {
+	if b.log == nil {
+		return nil
+	}
+	return b.log.Close()
+}
+
+func (b *broker) replay(path string) error {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for s.Scan() {
+		var r record
+		if err := json.Unmarshal(s.Bytes(), &r); err != nil {
+			return err
+		}
+		q := b.queue(r.Q)
+		switch r.Op {
+		case "P":
+			q.msgs.PushBack(r.V)
+		case "G":
+			if e := q.msgs.Front(); e != nil {
+				q.msgs.Remove(e)
+			}
+		default:
+			return fmt.Errorf("unknown op %q", r.Op)
+		}
+	}
+	return s.Err()
+}
+
+// appendLog must be called with b.mu held. Returns error if fsync fails.
+func (b *broker) appendLog(op, q, v string) error {
+	if b.log == nil {
+		return nil
+	}
+	data, _ := json.Marshal(record{Op: op, Q: q, V: v})
+	if _, err := b.log.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return b.log.Sync()
+}
 
 func (b *broker) queue(name string) *queue {
 	q, ok := b.qs[name]
@@ -59,32 +134,40 @@ func (b *broker) queue(name string) *queue {
 	return q
 }
 
-func (b *broker) put(name, msg string) {
+func (b *broker) put(name, msg string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if err := b.appendLog("P", name, msg); err != nil {
+		return err
+	}
 	q := b.queue(name)
 	if e := q.waiters.Front(); e != nil {
 		w := e.Value.(chan string)
 		q.waiters.Remove(e)
 		w <- msg
-		return
+		return nil
 	}
 	q.msgs.PushBack(msg)
+	return nil
 }
 
-func (b *broker) take(ctx context.Context, name string, timeout time.Duration) (string, bool) {
+func (b *broker) take(ctx context.Context, name string, timeout time.Duration) (string, bool, error) {
 	b.mu.Lock()
 	if q := b.qs[name]; q != nil {
 		if e := q.msgs.Front(); e != nil {
 			msg := e.Value.(string)
+			if err := b.appendLog("G", name, ""); err != nil {
+				b.mu.Unlock()
+				return "", false, err
+			}
 			q.msgs.Remove(e)
 			b.mu.Unlock()
-			return msg, true
+			return msg, true, nil
 		}
 	}
 	if timeout <= 0 {
 		b.mu.Unlock()
-		return "", false
+		return "", false, nil
 	}
 	q := b.queue(name)
 	w := make(chan string, 1)
@@ -95,7 +178,10 @@ func (b *broker) take(ctx context.Context, name string, timeout time.Duration) (
 	defer timer.Stop()
 	select {
 	case msg := <-w:
-		return msg, true
+		b.mu.Lock()
+		err := b.appendLog("G", name, "")
+		b.mu.Unlock()
+		return msg, true, err
 	case <-timer.C:
 	case <-ctx.Done():
 	}
@@ -103,10 +189,13 @@ func (b *broker) take(ctx context.Context, name string, timeout time.Duration) (
 	defer b.mu.Unlock()
 	select {
 	case msg := <-w:
-		return msg, true
+		if err := b.appendLog("G", name, ""); err != nil {
+			return "", false, err
+		}
+		return msg, true, nil
 	default:
 		q.waiters.Remove(we)
-		return "", false
+		return "", false, nil
 	}
 }
 
@@ -123,7 +212,11 @@ func (b *broker) handle(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		b.put(name, v)
+		if err := b.put(name, v); err != nil {
+			log.Error().Err(err).Str("queue", name).Msg("put")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		puts.WithLabelValues(name).Inc()
 		log.Info().Str("queue", name).Str("msg", v).Msg("put")
 	case http.MethodGet:
@@ -137,8 +230,13 @@ func (b *broker) handle(w http.ResponseWriter, r *http.Request) {
 			timeout = time.Duration(n) * time.Second
 		}
 		start := time.Now()
-		msg, ok := b.take(r.Context(), name, timeout)
+		msg, ok, err := b.take(r.Context(), name, timeout)
 		wait.Observe(time.Since(start).Seconds())
+		if err != nil {
+			log.Error().Err(err).Str("queue", name).Msg("get")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			gets.WithLabelValues(name, "miss").Inc()
 			w.WriteHeader(http.StatusNotFound)
@@ -154,10 +252,16 @@ func (b *broker) handle(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	port := flag.Int("port", 8080, "TCP port to listen on")
+	data := flag.String("data", "", "persistence log file path (empty disables persistence)")
 	flag.Parse()
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 
-	b := newBroker()
+	b, err := newBroker(*data)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init")
+	}
+	defer b.close()
+
 	mux := http.NewServeMux()
 	mux.Handle("/debug/metrics", promhttp.Handler())
 	mux.HandleFunc("/", b.handle)
@@ -170,7 +274,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info().Int("port", *port).Msg("listening")
+		log.Info().Int("port", *port).Str("data", *data).Msg("listening")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal().Err(err).Msg("listen")
 		}

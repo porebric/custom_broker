@@ -4,20 +4,26 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
 
-func newTestServer(t *testing.T) string {
+func newServer(t *testing.T, dataPath string) string {
 	t.Helper()
-	b := newBroker()
+	b, err := newBroker(dataPath)
+	if err != nil {
+		t.Fatalf("newBroker: %v", err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", b.handle)
 	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	t.Cleanup(func() { srv.Close(); b.close() })
 	return srv.URL
 }
+
+func newTestServer(t *testing.T) string { return newServer(t, "") }
 
 func put(t *testing.T, base, path string) int {
 	t.Helper()
@@ -160,6 +166,37 @@ func TestWaiterFIFO(t *testing.T) {
 	}
 	if codes[1] != 200 || got[1] != "second" {
 		t.Errorf("waiter 2: want 200 \"second\", got %d %q", codes[1], got[1])
+	}
+}
+
+// После рестарта (с тем же data-файлом) непрочитанные сообщения сохраняются,
+// прочитанные — не возвращаются повторно, FIFO сохраняется.
+func TestPersistenceAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	// раунд 1: положили 3, забрали 1 — должно остаться 2 в /pet и 1 в /role
+	{
+		base := newServer(t, path)
+		for _, p := range []string{"/pet?v=cat", "/pet?v=dog", "/role?v=manager"} {
+			if code := put(t, base, p); code != 200 {
+				t.Fatalf("PUT %s: %d", p, code)
+			}
+		}
+		if code, body := get(t, base, "/pet"); code != 200 || body != "cat" {
+			t.Fatalf("round 1 GET /pet: %d %q", code, body)
+		}
+	}
+	// t.Cleanup закроет первый сервер; открываем второй на том же файле
+	base := newServer(t, path)
+
+	if code, body := get(t, base, "/pet"); code != 200 || body != "dog" {
+		t.Errorf("after restart GET /pet (FIFO): want 200 \"dog\", got %d %q", code, body)
+	}
+	if code, body := get(t, base, "/pet"); code != 404 || body != "" {
+		t.Errorf("after restart GET /pet (empty): want 404, got %d %q", code, body)
+	}
+	if code, body := get(t, base, "/role"); code != 200 || body != "manager" {
+		t.Errorf("after restart GET /role: want 200 \"manager\", got %d %q", code, body)
 	}
 }
 
